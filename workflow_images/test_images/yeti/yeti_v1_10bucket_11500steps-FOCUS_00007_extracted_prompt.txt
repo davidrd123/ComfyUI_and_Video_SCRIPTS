@@ -1,0 +1,8 @@
+Rankin/Bass Animagic Stop-Motion: 
+
+**Rankin-Bass Animagic 2001 A Space Odyssey**
+
+[SHOT: MEDIUM WIDE INSIDE Centrifuge] Rankin-Bass Animagic King: A static shot looks down the curved length of the Discovery One's centrifuge set piece. The floor/ceiling curve is made of **smooth, off-white plastic panels** with **ribbed texture lines** indicating the direction of rotation. Along the "floor" (bottom curve of frame), a `dave-bowman-puppet` (wearing a simple **white felt jogging suit**, **molded plastic face** with neutral expression) jogs steadily in place. His articulated legs pump up and down with slightly exaggerated, jerky stop-motion movements (one full stride cycle every 8 frames). His arms swing stiffly at his sides. The background behind him shows the **curved white plastic wall** appearing to move past slowly (simulating rotation via backdrop movement or subtle camera rotation effect opposite puppet motion). The shot holds for 6 seconds (90 frames), emphasizing the routine.
+
+
+felt-fiber detail, fuzzy flock, wire-armature joints, frame-by-frame stutter, no motion blur, warm tungsten key, painted cardboard props
