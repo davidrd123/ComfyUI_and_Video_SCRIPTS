@@ -17,6 +17,34 @@ def _norm(s):
     """Normalize text: strip whitespace, return None if empty."""
     return (s or "").strip() or None
 
+def clean_prompts(prompts):
+    """
+    Clean and validate prompt data.
+    
+    - Normalize whitespace
+    - Remove duplicates (positive == negative)
+    - Set empty strings to None
+    
+    Args:
+        prompts (dict): {"positive": str|None, "negative": str|None, "_meta": dict|None}
+        
+    Returns:
+        dict: Cleaned prompts with same structure
+    """
+    pos = _norm(prompts.get("positive"))
+    neg = _norm(prompts.get("negative"))
+    
+    # Remove duplicate prompts
+    if pos and neg and pos == neg:
+        logger.info("Positive and negative prompts are identical, setting negative to None")
+        neg = None
+    
+    return {
+        "positive": pos,
+        "negative": neg,
+        "_meta": prompts.get("_meta")
+    }
+
 class UIGraph:
     """
     Normalizes a ComfyUI editor graph (nodes + links) for robust querying.
@@ -358,7 +386,27 @@ def get_workflow_from_image(image_path):
         logger.error(f"Error reading image or its metadata {image_path}: {e}")
         return None
 
-def extract_prompts(workflow):
+def get_workflow_from_json_file(json_path):
+    """
+    Reads workflow JSON directly from a JSON file.
+
+    Args:
+        json_path (str): Path to the JSON workflow file.
+
+    Returns:
+        str: The workflow JSON string, or None if not found or on error.
+    """
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error(f"JSON file not found at {json_path}")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading JSON file {json_path}: {e}")
+        return None
+
+def extract_prompts(workflow, collect_meta=False):
     """
     Extracts both positive and negative prompts from workflow data.
     Uses robust wiring-based detection instead of brittle heuristics.
@@ -388,9 +436,10 @@ def extract_prompts(workflow):
     
     Args:
         workflow (dict): The parsed JSON workflow data.
+        collect_meta (bool): If True, include metadata about prompt sources.
         
     Returns:
-        dict: {"positive": str|None, "negative": str|None}
+        dict: {"positive": str|None, "negative": str|None, "_meta": dict|None}
         
     Examples:
         Basketball JSON -> {"positive": "Perform a photorealistic edit...", 
@@ -400,7 +449,7 @@ def extract_prompts(workflow):
     """
     if not isinstance(workflow, dict):
         print("Error: Invalid workflow data provided (not a dictionary).")
-        return {"positive": None, "negative": None}
+        return {"positive": None, "negative": None, "_meta": None}
     
     # UI graph format (has "nodes" array)
     if "nodes" in workflow:
@@ -421,7 +470,16 @@ def extract_prompts(workflow):
             neg = g.read_text_from_node(neg_src, "negative")
 
             if pos or neg:
-                return {"positive": pos, "negative": neg}
+                result = {"positive": pos, "negative": neg}
+                if collect_meta:
+                    result["_meta"] = {
+                        "sampler_id": sampler["id"],
+                        "sampler_type": sampler.get("type"),
+                        "positive_src_id": pos_src,
+                        "negative_src_id": neg_src,
+                        "path": f"{sampler.get('type')} → pos:{pos_src}, neg:{neg_src}"
+                    }
+                return result
         
         # (b) Sampler with text_embeds (WanVideoSampler)
         sampler = g.sampler_with_text_embeds()
@@ -445,22 +503,46 @@ def extract_prompts(workflow):
                     pos = g.read_text_from_node(p_src, "positive")
                     neg = g.read_text_from_node(n_src, "negative")
                     if pos or neg:
-                        return {"positive": pos, "negative": neg}
+                        result = {"positive": pos, "negative": neg}
+                        if collect_meta:
+                            result["_meta"] = {
+                                "sampler_id": sampler["id"],
+                                "sampler_type": sampler.get("type"),
+                                "bridge_id": embeds_src,
+                                "positive_src_id": p_src,
+                                "negative_src_id": n_src,
+                                "path": f"{sampler.get('type')} → WanVideoTextEmbedBridge → pos:{p_src}, neg:{n_src}"
+                            }
+                        return result
                         
                 elif src_type == "WanVideoTextEncode":
                     # WTE packs both prompts: widgets_values[0]=pos, [1]=neg
                     logger.info(f"Reading from WanVideoTextEncode node {embeds_src}")
                     w = src_node.get("widgets_values") or []
-                    return {"positive": _safe_get(w, 0), "negative": _safe_get(w, 1)}
+                    result = {"positive": _safe_get(w, 0), "negative": _safe_get(w, 1)}
+                    if collect_meta:
+                        result["_meta"] = {
+                            "sampler_id": sampler["id"],
+                            "sampler_type": sampler.get("type"),
+                            "wte_id": embeds_src,
+                            "path": f"{sampler.get('type')} → WanVideoTextEncode"
+                        }
+                    return result
             
         # (c) Fallback: standalone WanVideoTextEncode in the graph
         wte = g.first_node("WanVideoTextEncode")
         if wte:
             logger.info(f"Found standalone WanVideoTextEncode node: {wte['id']}")
             w = wte.get("widgets_values") or []
-            return {"positive": _safe_get(w, 0), "negative": _safe_get(w, 1)}
+            result = {"positive": _safe_get(w, 0), "negative": _safe_get(w, 1)}
+            if collect_meta:
+                result["_meta"] = {
+                    "wte_id": wte["id"],
+                    "path": "standalone WanVideoTextEncode"
+                }
+            return result
 
-        return {"positive": None, "negative": None}
+        return {"positive": None, "negative": None, "_meta": None}
     
     # API graph format (flat dictionary)
     else:
@@ -469,7 +551,13 @@ def extract_prompts(workflow):
             if isinstance(node, dict) and node.get("class_type") == "WanVideoTextEncode":
                 inputs = node.get("inputs", {})
                 logger.info(f"Found WanVideoTextEncode node in API format: {nid}")
-                return {"positive": inputs.get("positive_prompt"), "negative": inputs.get("negative_prompt")}
+                result = {"positive": inputs.get("positive_prompt"), "negative": inputs.get("negative_prompt")}
+                if collect_meta:
+                    result["_meta"] = {
+                        "wte_id": nid,
+                        "path": "API format WanVideoTextEncode"
+                    }
+                return result
         
         # Also check for TextEncodeQwenImageEdit in API format
         for nid, node in workflow.items():
@@ -477,9 +565,15 @@ def extract_prompts(workflow):
                 inputs = node.get("inputs", {})
                 logger.info(f"Found TextEncodeQwenImageEdit node in API format: {nid}")
                 if "prompt" in inputs:
-                    return {"positive": inputs["prompt"], "negative": None}
+                    result = {"positive": inputs["prompt"], "negative": None}
+                    if collect_meta:
+                        result["_meta"] = {
+                            "qwen_id": nid,
+                            "path": "API format TextEncodeQwenImageEdit"
+                        }
+                    return result
         
-        return {"positive": None, "negative": None}
+        return {"positive": None, "negative": None, "_meta": None}
 
 def extract_specific_prompt_from_json_data(workflow):
     """
@@ -501,17 +595,19 @@ def extract_specific_prompt_from_json_data(workflow):
     else:
         return None
 
-def process_png_file(input_png_file, output_directory, extract_json=False, extract_both=False, force_overwrite=False):
-    """Processes a single PNG file to extract and save the specific prompt or full workflow JSON.
+def process_png_file(input_file, output_directory, extract_json=False, extract_both=False, emit_meta=False, force_overwrite=False, is_json_input=False):
+    """Processes a single PNG or JSON file to extract and save the specific prompt or full workflow JSON.
     
     Args:
-        input_png_file (str): Path to the PNG file to process
+        input_file (str): Path to the PNG or JSON file to process
         output_directory (str): Directory to save the output file
         extract_json (bool): If True, extract full workflow JSON; if False, extract prompt text
         extract_both (bool): If True, extract both positive/negative prompts as JSON
+        emit_meta (bool): If True, include metadata about prompt sources
         force_overwrite (bool): If True, overwrite existing files; if False, skip existing files
+        is_json_input (bool): If True, input_file is a JSON file; if False, it's a PNG file
     """
-    base_filename = os.path.splitext(os.path.basename(input_png_file))[0]
+    base_filename = os.path.splitext(os.path.basename(input_file))[0]
     
     if extract_json:
         output_file = os.path.join(output_directory, f"{base_filename}.json")
@@ -529,8 +625,13 @@ def process_png_file(input_png_file, output_directory, extract_json=False, extra
     elif os.path.exists(output_file) and force_overwrite:
         logger.info(f"Overwriting existing {file_type} file {output_file}.")
 
-    logger.info(f"Processing {input_png_file}...")
-    workflow_json_string = get_workflow_from_image(input_png_file)
+    logger.info(f"Processing {input_file}...")
+    
+    # Get workflow JSON from appropriate source
+    if is_json_input:
+        workflow_json_string = get_workflow_from_json_file(input_file)
+    else:
+        workflow_json_string = get_workflow_from_image(input_file)
 
     if workflow_json_string:
         try:
@@ -543,13 +644,13 @@ def process_png_file(input_png_file, output_directory, extract_json=False, extra
                         json.dump(workflow_json_data, f, indent=2, ensure_ascii=False)
                     logger.info(f"Successfully created workflow JSON file {output_file}")
                     
-                    # Set timestamp from source PNG
+                    # Set timestamp from source file
                     try:
-                        source_png_stat = os.stat(input_png_file)
-                        source_png_mtime = source_png_stat.st_mtime
-                        source_png_atime = source_png_stat.st_atime
-                        os.utime(output_file, (source_png_atime, source_png_mtime))
-                        logger.info(f"Updated timestamp of {output_file} to match {input_png_file}")
+                        source_stat = os.stat(input_file)
+                        source_mtime = source_stat.st_mtime
+                        source_atime = source_stat.st_atime
+                        os.utime(output_file, (source_atime, source_mtime))
+                        logger.info(f"Updated timestamp of {output_file} to match {input_file}")
                     except OSError as e:
                         if e.errno == 1: # Operation not permitted
                             logger.warning(f"Could not set timestamp for {output_file} (Operation not permitted). File created with current timestamp.")
@@ -560,21 +661,24 @@ def process_png_file(input_png_file, output_directory, extract_json=False, extra
                     logger.error(f"Could not write to output file {output_file}. {e}")
             elif extract_both:
                 # Extract both positive and negative prompts as JSON
-                prompts = extract_prompts(workflow_json_data)
+                prompts = extract_prompts(workflow_json_data, collect_meta=emit_meta)
+                prompts = clean_prompts(prompts)  # Clean and validate
                 out = {"positive": prompts["positive"], "negative": prompts["negative"]}
+                if emit_meta and prompts.get("_meta"):
+                    out["_meta"] = prompts["_meta"]
                 
                 try:
                     with open(output_file, 'w', encoding='utf-8') as f:
                         json.dump(out, f, indent=2, ensure_ascii=False)
                     logger.info(f"Successfully created prompts JSON file {output_file}")
                     
-                    # Set timestamp from source PNG
+                    # Set timestamp from source file
                     try:
-                        source_png_stat = os.stat(input_png_file)
-                        source_png_mtime = source_png_stat.st_mtime
-                        source_png_atime = source_png_stat.st_atime
-                        os.utime(output_file, (source_png_atime, source_png_mtime))
-                        logger.info(f"Updated timestamp of {output_file} to match {input_png_file}")
+                        source_stat = os.stat(input_file)
+                        source_mtime = source_stat.st_mtime
+                        source_atime = source_stat.st_atime
+                        os.utime(output_file, (source_atime, source_mtime))
+                        logger.info(f"Updated timestamp of {output_file} to match {input_file}")
                     except OSError as e:
                         if e.errno == 1: # Operation not permitted
                             logger.warning(f"Could not set timestamp for {output_file} (Operation not permitted). File created with current timestamp.")
@@ -585,7 +689,24 @@ def process_png_file(input_png_file, output_directory, extract_json=False, extra
                     logger.error(f"Could not write to output file {output_file}. {e}")
             else:
                 # Extract specific prompt (original behavior)
-                specific_prompt = extract_specific_prompt_from_json_data(workflow_json_data)
+                prompts = extract_prompts(workflow_json_data, collect_meta=emit_meta)
+                prompts = clean_prompts(prompts)  # Clean and validate
+                specific_prompt = prompts["positive"] or prompts["negative"]
+
+                # Log metadata if requested (even for single prompt extraction)
+                if emit_meta and prompts.get("_meta"):
+                    meta = prompts["_meta"]
+                    logger.info(f"Prompt extraction metadata:")
+                    logger.info(f"  Sampler: {meta.get('sampler_type', 'N/A')} (ID: {meta.get('sampler_id', 'N/A')})")
+                    logger.info(f"  Path: {meta.get('path', 'N/A')}")
+                    if meta.get('positive_src_id'):
+                        logger.info(f"  Positive source: Node {meta['positive_src_id']}")
+                    if meta.get('negative_src_id'):
+                        logger.info(f"  Negative source: Node {meta['negative_src_id']}")
+                    if meta.get('wte_id'):
+                        logger.info(f"  WTE node: {meta['wte_id']}")
+                    if meta.get('bridge_id'):
+                        logger.info(f"  Bridge node: {meta['bridge_id']}")
 
                 if specific_prompt:
                     try:
@@ -594,12 +715,12 @@ def process_png_file(input_png_file, output_directory, extract_json=False, extra
                         logger.info(f"Successfully created prompt file {output_file}")
 
                         try:
-                            # Attempt to set timestamp from source PNG
-                            source_png_stat = os.stat(input_png_file)
-                            source_png_mtime = source_png_stat.st_mtime
-                            source_png_atime = source_png_stat.st_atime
-                            os.utime(output_file, (source_png_atime, source_png_mtime))
-                            logger.info(f"Updated timestamp of {output_file} to match {input_png_file}")
+                            # Attempt to set timestamp from source file
+                            source_stat = os.stat(input_file)
+                            source_mtime = source_stat.st_mtime
+                            source_atime = source_stat.st_atime
+                            os.utime(output_file, (source_atime, source_mtime))
+                            logger.info(f"Updated timestamp of {output_file} to match {input_file}")
                         except OSError as e:
                             if e.errno == 1: # Operation not permitted
                                 logger.warning(f"Could not set timestamp for {output_file} (Operation not permitted). File created with current timestamp.")
@@ -612,11 +733,11 @@ def process_png_file(input_png_file, output_directory, extract_json=False, extra
                     # If specific_prompt is None, it means none of the supported node types or their values weren't found.
                     # We might not want to create an empty .txt file, or we might. 
                     # For now, we only create a file if a prompt is found.
-                    logger.info(f"No specific prompt found in {input_png_file}. No output file created.")
+                    logger.info(f"No specific prompt found in {input_file}. No output file created.")
         except json.JSONDecodeError:
-            logger.error(f"Could not decode workflow JSON from {input_png_file}.")
+            logger.error(f"Could not decode workflow JSON from {input_file}.")
     else:
-        logger.error(f"Failed to get workflow JSON from {input_png_file}. No output file created.")
+        logger.error(f"Failed to get workflow JSON from {input_file}. No output file created.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -625,10 +746,12 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-f", "--file", dest="png_file", help="Path to a single PNG image file with embedded workflow.")
     group.add_argument("-d", "--directory", dest="png_directory", help="Path to a directory containing PNG image files.")
+    group.add_argument("--json-file", dest="json_file", help="Path to a JSON workflow file (extract prompts directly from JSON).")
     
     parser.add_argument("-o", "--output_dir", help="Directory to save the extracted files. If not specified, output is saved alongside source files.")
     parser.add_argument("-j", "--json", action="store_true", help="Extract full workflow JSON instead of just the prompt text. Creates .json files instead of .txt files.")
     parser.add_argument("--both", action="store_true", help="Write JSON with both positive/negative prompts instead of single text file.")
+    parser.add_argument("--emit-meta", action="store_true", help="Include metadata about prompt sources in output (JSON with --both, logging with single prompt).")
     parser.add_argument("--force", action="store_true", help="Overwrite existing output files instead of skipping them. Useful for testing and re-processing.")
 
     args = parser.parse_args()
@@ -658,7 +781,12 @@ if __name__ == "__main__":
         if not os.path.isfile(args.png_file):
             logger.error(f"File not found at {args.png_file}")
             exit(1)
-        process_png_file(args.png_file, determined_output_dir, args.json, args.both, args.force)
+        process_png_file(args.png_file, determined_output_dir, args.json, args.both, args.emit_meta, args.force, is_json_input=False)
+    elif args.json_file:
+        if not os.path.isfile(args.json_file):
+            logger.error(f"JSON file not found at {args.json_file}")
+            exit(1)
+        process_png_file(args.json_file, determined_output_dir, args.json, args.both, args.emit_meta, args.force, is_json_input=True)
     elif args.png_directory:
         if not os.path.isdir(args.png_directory):
             logger.error(f"Directory not found at {args.png_directory}")
@@ -671,7 +799,7 @@ if __name__ == "__main__":
         else:
             logger.info(f"Found {len(png_files)} PNG files in {args.png_directory}.")
             for png_file_path in png_files:
-                process_png_file(png_file_path, determined_output_dir, args.json, args.both, args.force)
+                process_png_file(png_file_path, determined_output_dir, args.json, args.both, args.emit_meta, args.force, is_json_input=False)
                 logger.info("---") # Separator for multiple files
     
     logger.info("Processing complete.")
